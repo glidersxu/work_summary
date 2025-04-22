@@ -1,0 +1,9 @@
+{
+  "open_ai_api_base": "http://localhost:8000/v1",
+  "open_ai_api_key": "test-key",
+  "open_ai_model": "gpt-4o-mini",
+  "white_chat_name": ["测试群1", "测试群2"],
+  "summary_schedule": "0 0 * * *",
+  "cleanup_schedule": "0 1 * * *",
+  "task_prompt": "请根据以下群聊内容整理出工作任务列表。每个任务包含以下内容：\n\n- 任务名称（50字以内）\n- 负责人（不超过3人）\n- 截止时间（如果有提到）\n- 任务描述（100字以内）\n- 优先级（高/中/低）\n\n请按照优先级从高到低排序，并确保：\n1. 只提取明确的任务内容\n2. 不要虚构任务\n3. 使用中文冒号\n4. 每个任务之间用 ------------ 分隔\n\n最后总结今日任务总数和优先级分布。"
+} 
