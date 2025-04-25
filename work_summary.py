@@ -6,7 +6,9 @@ from bridge.context import ContextType  # 上下文类型定义
 from bridge.reply import Reply, ReplyType  # 回复类型定义
 from channel.chat_message import ChatMessage  # 聊天消息处理
 from common.log import logger  # 日志模块
-from plugins import *  # 插件基础类
+from plugins import Plugin  # 插件基础类
+from bridge.context import EventContext, EventAction  # 事件上下文
+from common.event_msg import Event  # 事件定义
 from config import conf  # 配置模块
 import sqlite3  # SQLite数据库
 from datetime import datetime  # 日期时间处理
@@ -76,7 +78,7 @@ class WorkSummary(Plugin):
     def init_database(self):
         """初始化数据库"""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=30) as conn:
                 cursor = conn.cursor()
                 # 创建聊天记录表
                 cursor.execute('''
@@ -90,6 +92,10 @@ class WorkSummary(Plugin):
                         UNIQUE(group_id, user_nickname, content, create_time)
                     )
                 ''')
+                # 创建索引
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_chat_records_group_time ON chat_records(group_id, create_time)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_chat_records_time ON chat_records(create_time)')
+                
                 # 创建群组信息表
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS group_info (
@@ -99,17 +105,22 @@ class WorkSummary(Plugin):
                     )
                 ''')
                 conn.commit()
-                logger.info("数据库初始化成功")
+                logger.info("[work_summary] 数据库初始化成功")
         except Exception as e:
-            logger.error(f"[work_summary]数据库初始化异常：{e}")
+            logger.error(f"[work_summary] 数据库初始化异常：{e}")
+            raise
 
     def start_scheduled_tasks(self):
         """启动定时任务"""
         def run_schedule():
             """运行定时任务的主循环"""
             while True:
-                schedule.run_pending()
-                time.sleep(1)  # 减少CPU占用
+                try:
+                    schedule.run_pending()
+                    time.sleep(1)  # 减少CPU占用
+                except Exception as e:
+                    logger.error(f"[work_summary] 定时任务主循环异常：{e}")
+                    time.sleep(5)  # 发生异常时等待5秒再继续
 
         def validate_time(time_str):
             """验证时间格式是否正确"""
@@ -121,17 +132,34 @@ class WorkSummary(Plugin):
             except:
                 return False
 
+        def run_with_retry(func, max_retries=3):
+            """带重试机制的任务执行"""
+            for i in range(max_retries):
+                try:
+                    func()
+                    return
+                except Exception as e:
+                    if i == max_retries - 1:
+                        logger.error(f"[work_summary] 任务执行失败，已达到最大重试次数：{e}")
+                    else:
+                        logger.warning(f"[work_summary] 任务执行失败，第{i+1}次重试：{e}")
+                        time.sleep(2 ** i)  # 指数退避
+
         try:
             # 设置总结定时任务
             if validate_time(self.summary_time):
-                schedule.every().day.at(self.summary_time).do(self.generate_daily_task_summary)
+                schedule.every().day.at(self.summary_time).do(
+                    lambda: run_with_retry(self.generate_daily_task_summary)
+                )
                 logger.info(f"[work_summary] 设置总结时间为: {self.summary_time}")
             else:
                 logger.error(f"[work_summary] 总结时间格式错误: {self.summary_time}")
 
             # 设置清理定时任务
             if validate_time(self.cleanup_time):
-                schedule.every().day.at(self.cleanup_time).do(self.cleanup_old_records)
+                schedule.every().day.at(self.cleanup_time).do(
+                    lambda: run_with_retry(self.cleanup_old_records)
+                )
                 logger.info(f"[work_summary] 设置清理时间为: {self.cleanup_time}")
             else:
                 logger.error(f"[work_summary] 清理时间格式错误: {self.cleanup_time}")
@@ -140,8 +168,10 @@ class WorkSummary(Plugin):
             schedule_thread = threading.Thread(target=run_schedule)
             schedule_thread.daemon = True
             schedule_thread.start()
+            logger.info("[work_summary] 定时任务线程启动成功")
         except Exception as e:
             logger.error(f"[work_summary] 启动定时任务异常: {e}")
+            raise
 
     def generate_daily_task_summary(self):
         """生成每日任务总结"""
@@ -280,71 +310,99 @@ class WorkSummary(Plugin):
 
     def on_handle_context(self, e_context: EventContext):
         """处理上下文事件"""
-        if e_context["context"].type not in [
-            ContextType.TEXT
-        ]:
-            return
-        msg: ChatMessage = e_context["context"]["msg"]
-       
-        content = e_context["context"].content.strip()
-        if content.startswith("总结聊天"):
+        try:
+            if e_context["context"].type not in [ContextType.TEXT]:
+                return
+                
+            msg: ChatMessage = e_context["context"]["msg"]
+            content = e_context["context"].content.strip()
+            
+            if not content.startswith("总结聊天"):
+                return
+                
             reply = Reply()
             reply.type = ReplyType.TEXT
-            if msg.other_user_nickname in self.white_chat_name:
-                reply.content = "我母鸡啊"
+            
+            # 检查是否是群聊
+            if not e_context["context"]["isgroup"]:
+                reply.content = "只支持群聊总结"
                 e_context["reply"] = reply
                 e_context.action = EventAction.BREAK_PASS
                 return
+                
+            # 检查是否在白名单中
+            if msg.other_user_nickname not in self.white_chat_name:
+                reply.content = "该群未开启工作总结功能"
+                e_context["reply"] = reply
+                e_context.action = EventAction.BREAK_PASS
+                return
+                
+            # 解析聊天记录数量
             number = content[4:].strip()
-            number_int=99
+            number_int = 99  # 默认值
             if number.isdigit():
-                # 转换为整数
                 number_int = int(number)
-            if e_context["context"]["isgroup"]:
-                try:
-                    # 从数据库获取聊天记录
-                    with sqlite3.connect(self.db_path) as conn:
-                        cursor = conn.cursor()
-                        cursor.execute('''
-                            SELECT user_nickname, content, create_time 
-                            FROM chat_records 
-                            WHERE group_id = ? 
-                            ORDER BY create_time DESC 
-                            LIMIT ?
-                        ''', (msg.other_user_id, number_int))
+                if number_int <= 0:
+                    reply.content = "请输入大于0的数字"
+                    e_context["reply"] = reply
+                    e_context.action = EventAction.BREAK_PASS
+                    return
+                    
+            try:
+                # 从数据库获取聊天记录
+                with sqlite3.connect(self.db_path, timeout=30) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                        SELECT user_nickname, content, create_time 
+                        FROM chat_records 
+                        WHERE group_id = ? 
+                        ORDER BY create_time DESC 
+                        LIMIT ?
+                    ''', (msg.other_user_id, number_int))
+                    
+                    records = cursor.fetchall()
+                    if not records:
+                        reply.content = "暂无聊天记录"
+                        e_context["reply"] = reply
+                        e_context.action = EventAction.BREAK_PASS
+                        return
                         
-                        records = cursor.fetchall()
-                        chat_list = [
-                            {
-                                "user": record[0],
-                                "content": record[1],
-                                "time": record[2]
-                            }
-                            for record in records
-                        ]
-                        chat_list.reverse()  # 按时间正序排列
-                        
-                        cont = self.task_prompt + "----聊天记录如下：" + json.dumps(chat_list, ensure_ascii=False)
-                        reply.content = self.shyl(cont)
-                except Exception as e:
-                    logger.error(f"[work_summary]获取聊天记录异常：{e}")
-                    reply.content = "获取聊天记录失败"
-            else:
-                    reply.content = "只做群聊总结"
+                    # 格式化聊天记录
+                    chat_list = [
+                        {
+                            "user": record[0],
+                            "content": record[1],
+                            "time": record[2]
+                        }
+                        for record in records
+                    ]
+                    chat_list.reverse()  # 按时间正序排列
+                    
+                    # 生成任务总结
+                    cont = self.task_prompt + "\n----聊天记录如下：" + json.dumps(chat_list, ensure_ascii=False)
+                    reply.content = self.shyl(cont)
+                    
+            except sqlite3.Error as e:
+                logger.error(f"[work_summary] 数据库操作异常: {e}")
+                reply.content = "获取聊天记录失败，请稍后重试"
+            except Exception as e:
+                logger.error(f"[work_summary] 处理聊天记录异常: {e}")
+                reply.content = "处理聊天记录失败，请稍后重试"
+                
             e_context["reply"] = reply
-            e_context.action = EventAction.BREAK_PASS  # 事件结束，并跳过处理context的默认逻辑
+            e_context.action = EventAction.BREAK_PASS
+            
+        except Exception as e:
+            logger.error(f"[work_summary] 处理上下文事件异常: {e}")
+            # 确保即使发生异常也能正确设置回复
+            if not e_context.get("reply"):
+                reply = Reply()
+                reply.type = ReplyType.TEXT
+                reply.content = "处理请求时发生错误，请稍后重试"
+                e_context["reply"] = reply
+                e_context.action = EventAction.BREAK_PASS
 
-    def on_receive_message(self, e_context: EventContext):
-        """接收消息事件处理"""
-        if e_context["context"].type not in [
-            ContextType.TEXT
-        ]:
-            return
-        msg: ChatMessage = e_context["context"]["msg"]
-        if msg.other_user_nickname in self.white_chat_name:
-            self.add_conetent(msg)
-
-    def add_conetent(self, message):
+    def add_content(self, message):
         """添加聊天记录到数据库"""
         try:
             with sqlite3.connect(self.db_path) as conn:
@@ -366,55 +424,127 @@ class WorkSummary(Plugin):
         except Exception as e:
             logger.error(f"[work_summary]添加聊天记录异常：{e}")
 
+    def on_receive_message(self, e_context: EventContext):
+        """接收消息事件处理"""
+        if e_context["context"].type not in [
+            ContextType.TEXT
+        ]:
+            return
+        msg: ChatMessage = e_context["context"]["msg"]
+        if msg.other_user_nickname in self.white_chat_name:
+            self.add_content(msg)
+
     def get_help_text(self, **kwargs):
         """获取帮助文本"""
         help_text = "总结聊天+数量；例：总结聊天 30"
         return help_text
 
-    def shyl(self, content):
-        """调用OpenAI API生成总结"""
+    def shyl(self, content, max_retries=3, timeout=30):
+        """调用OpenAI API生成总结
+        
+        Args:
+            content: 需要总结的内容
+            max_retries: 最大重试次数
+            timeout: 请求超时时间（秒）
+        
+        Returns:
+            str: 生成的总结内容
+        """
         import requests
-        import json
-        url = self.open_ai_api_base+"/chat/completions"
-        payload = json.dumps({
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        
+        # 创建带重试机制的会话
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=max_retries,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        
+        url = self.open_ai_api_base + "/chat/completions"
+        payload = {
             "model": self.open_ai_model,
             "messages": [{"role": "user", "content": content}],
-            "stream": False
-        })
+            "stream": False,
+            "temperature": 0.7,
+            "max_tokens": 2000
+        }
         headers = {
-            'Authorization': 'Bearer '+self.open_ai_api_key,
+            'Authorization': f'Bearer {self.open_ai_api_key}',
             'Content-Type': 'application/json'
         }
+        
         try:
-            response = requests.request("POST", url, headers=headers, data=payload)
+            response = session.post(url, json=payload, headers=headers, timeout=timeout)
+            response.raise_for_status()  # 抛出非200响应的异常
+            
             if response.status_code == 200:
                 response_json = response.json()
                 content = response_json['choices'][0]['message']['content']
                 return content
-            else:
-                logger.error(f"[work_summary] OpenAI API请求失败，状态码：{response.status_code}")
-                return '模型请求失败了，请稍后重试'
+            
+        except requests.exceptions.Timeout:
+            logger.error("[work_summary] OpenAI API 请求超时")
+            return '请求超时，请稍后重试'
         except requests.exceptions.RequestException as e:
-            logger.error(f"[work_summary] OpenAI API请求异常: {e}")
-            return '模型请求异常，请稍后重试'
+            logger.error(f"[work_summary] OpenAI API 请求异常: {e}")
+            return '请求异常，请稍后重试'
+        except KeyError as e:
+            logger.error(f"[work_summary] OpenAI API 响应格式异常: {e}")
+            return '响应格式异常，请稍后重试'
         except Exception as e:
-            logger.error(f"[work_summary] 处理OpenAI API响应异常: {e}")
-            return '处理响应异常，请稍后重试'
+            logger.error(f"[work_summary] OpenAI API 未知异常: {e}")
+            return '发生未知错误，请稍后重试'
 
     def _load_config_template(self):
         """加载配置模板"""
         try:
             plugin_config_path = os.path.join(self.path, "config.json.template")
-            if os.path.exists(plugin_config_path):
-                with open(plugin_config_path, "r", encoding="utf-8") as f:
-                    plugin_conf = json.load(f)
-                    # 验证必要配置项
-                    required_fields = ["open_ai_api_base", "open_ai_api_key", "open_ai_model", "white_chat_name"]
-                    for field in required_fields:
-                        if field not in plugin_conf:
-                            logger.error(f"[work_summary] 配置缺少必要字段: {field}")
-                            return None
-                    return plugin_conf
+            if not os.path.exists(plugin_config_path):
+                logger.error("[work_summary] 配置模板文件不存在")
+                return None
+                
+            with open(plugin_config_path, "r", encoding="utf-8") as f:
+                plugin_conf = json.load(f)
+                
+            # 验证必要配置项
+            required_fields = {
+                "open_ai_api_base": "OpenAI API基础URL",
+                "open_ai_api_key": "OpenAI API密钥",
+                "open_ai_model": "OpenAI模型名称",
+                "white_chat_name": "白名单群聊列表"
+            }
+            
+            missing_fields = []
+            for field, desc in required_fields.items():
+                if field not in plugin_conf:
+                    missing_fields.append(f"{desc}({field})")
+            
+            if missing_fields:
+                logger.error(f"[work_summary] 配置缺少必要字段: {', '.join(missing_fields)}")
+                return None
+                
+            # 验证配置值的有效性
+            if not isinstance(plugin_conf["white_chat_name"], list):
+                logger.error("[work_summary] white_chat_name 必须是列表类型")
+                return None
+                
+            if not plugin_conf["open_ai_api_base"].startswith(("http://", "https://")):
+                logger.error("[work_summary] open_ai_api_base 必须是有效的URL")
+                return None
+                
+            if not plugin_conf["open_ai_api_key"]:
+                logger.error("[work_summary] open_ai_api_key 不能为空")
+                return None
+                
+            return plugin_conf
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"[work_summary] 配置文件JSON格式错误: {e}")
             return None
         except Exception as e:
             logger.error(f"[work_summary] 加载配置模板异常: {e}")

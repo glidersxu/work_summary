@@ -1,1 +1,1 @@
-from .group_chat_summary import *
+from .work_summary import *
